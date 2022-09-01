@@ -281,6 +281,18 @@ func FetchAlgoAddressesFromPackedValue(data []byte) ([]string, error) {
 	return algoAddresses, nil
 }
 
+// We need to be able to sort keys returned in global state by the decoded key name, so define an implementation
+// of the Sort interface for the state key names.
+type byKeyName []models.TealKeyValue
+
+func (a byKeyName) Len() int      { return len(a) }
+func (a byKeyName) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a byKeyName) Less(i, j int) bool {
+	keyI, _ := base64.StdEncoding.DecodeString(a[i].Key)
+	keyJ, _ := base64.StdEncoding.DecodeString(a[j].Key)
+	return bytes.Compare(keyI, keyJ) == -1
+}
+
 func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties {
 	isStringPrintable := func(str string) bool {
 		for _, strRune := range str {
@@ -300,6 +312,8 @@ func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties 
 		valAsStr      string
 		algoAddresses []string
 	)
+	// Some keys must be sorted to ensure proper ordering of decoding (v.caAlgo.0.as, v.caAlgo.1.as, .. for eg)
+	sort.Sort(byKeyName(appState))
 	for _, kv := range appState {
 		rawKey, _ := base64.StdEncoding.DecodeString(kv.Key)
 		decodedKey = string(rawKey)
@@ -307,7 +321,7 @@ func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties 
 		switch kv.Value.Type {
 		case 1: // bytes
 			value, _ := base64.StdEncoding.DecodeString(kv.Value.Bytes)
-			if strings.HasSuffix(decodedKey, ".as") { // caAlgo.##.as (sets of packed algorand addresses)
+			if strings.HasSuffix(decodedKey, ".as") { // caAlgo.#.as (sets of packed algorand addresses)
 				addresses, err := FetchAlgoAddressesFromPackedValue(value)
 				if err != nil {
 					valAsStr = err.Error()
