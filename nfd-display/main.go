@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -19,12 +20,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
-	"github.com/algorand/go-algorand-sdk/client/v2/algod"
-	"github.com/algorand/go-algorand-sdk/client/v2/common/models"
-	"github.com/algorand/go-algorand-sdk/crypto"
-	"github.com/algorand/go-algorand-sdk/types"
+	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
+	"github.com/algorand/go-algorand-sdk/v2/client/v2/common/models"
+	"github.com/algorand/go-algorand-sdk/v2/crypto"
+	"github.com/algorand/go-algorand-sdk/v2/types"
+	"github.com/mailgun/holster/v4/syncutil"
 )
 
 var (
@@ -44,8 +47,10 @@ func main() {
 		err     error
 		name    = flag.String("name", "", ".algo Name for forward lookup")
 		address = flag.String("addr", "", "Algorand address for reverse-address lookup")
-		network = flag.String("network", "mainnet", "network: mainnet or testnet")
-		appID   uint64
+		network = flag.String("network", "mainnet", "network: mainnet, testnet, or specify algod, token, regApp parameters")
+		algoUrl = flag.String("algod", "", "url of algod host to connect to (ie: http://localhost:8080)")
+		token   = flag.String("token", "", "api key token to pass to algod (if needed)")
+		regApp  = flag.Uint64("regApp", 0, "registry smart contract ID (for local dev)")
 	)
 	flag.Parse()
 
@@ -53,42 +58,61 @@ func main() {
 		flag.Usage()
 		log.Fatalln("You must specify a name, or an address")
 	}
-	// Set registry id and set up algod connection to public algod endpoint
-	switch *network {
-	case "testnet":
-		registryAppID = 84366825
-		algoClient, err = algod.MakeClient("https://testnet-api.algonode.cloud", "")
-	case "mainnet":
-		registryAppID = 760937186
-		algoClient, err = algod.MakeClient("https://mainnet-api.algonode.cloud", "")
-	default:
-		flag.Usage()
-		log.Fatalln("unknown network:", *network)
-	}
-	if err != nil {
-		log.Fatalln(err)
+	if *algoUrl != "" {
+		algoClient, err = algod.MakeClient(*algoUrl, *token)
+		registryAppID = *regApp
+	} else {
+		// Set registry id and set up algod connection to public algod endpoint
+		switch *network {
+		case "testnet":
+			registryAppID = 84366825
+			algoClient, err = algod.MakeClient("https://testnet-api.algonode.cloud", "")
+		case "mainnet":
+			registryAppID = 760937186
+			algoClient, err = algod.MakeClient("https://mainnet-api.algonode.cloud", "")
+		default:
+			flag.Usage()
+			log.Fatalln("unknown network:", *network)
+		}
+		if err != nil {
+			log.Fatalln(err)
+		}
 	}
 
 	if *name != "" {
-		appID, err = FindNFDAppIDByName(ctx, *name)
+		appID, err := FindNFDAppIDByName(ctx, *name)
 		if err != nil {
 			log.Fatalln("Error in findind/fetching name:", *name, "error:", err)
 		}
+		displayNFD(ctx, appID)
 	} else if *address != "" {
-		appID, err = FindNFDAppIDByAddress(ctx, *address)
+		appIDs, err := FindNFDAppIDsByAddress(ctx, *address)
 		if err != nil {
 			log.Fatalln("Error in finding/fetching address:", *address, "error:", err)
 		}
+		for _, appID := range appIDs {
+			displayNFD(ctx, appID)
+		}
 	}
+}
+
+func displayNFD(ctx context.Context, appID uint64) {
 	fmt.Println("NFD AppID:", appID)
 
-	// Load the global state of this application
+	// Load the global state of this NFD
 	appData, err := algoClient.GetApplicationByID(appID).Do(ctx)
 	if err != nil {
 		log.Fatalln(err)
 	}
+	// Now load all the box data (V2) in parallel
+	boxData, err := GetApplicationBoxes(ctx, appID)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Println("Byte-code hash:", crypto.AddressFromProgram(appData.Params.ApprovalProgram).String())
+
 	// Fetch everything into key/value map...
-	properties := FetchAllStateAsNFDProperties(appData.Params.GlobalState)
+	properties := FetchAllStateAsNFDProperties(appData.Params.GlobalState, boxData)
 	// ...then merge properties like bio_00, bio_01, into 'bio'
 	properties.UserDefined = MergeNFDProperties(properties.UserDefined)
 	prettyJson, _ := json.MarshalIndent(properties, "", "  ")
@@ -96,7 +120,53 @@ func main() {
 	fmt.Println(string(prettyJson))
 }
 
+func GetApplicationBoxes(ctx context.Context, appID uint64) (map[string][]byte, error) {
+	var (
+		wg      syncutil.WaitGroup
+		boxData = map[string][]byte{}
+		mapLock sync.Mutex
+	)
+
+	// First fetch the list of boxes
+	boxes, err := algoClient.GetApplicationBoxes(appID).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve boxes list: %w", err)
+	}
+
+	// Now fetch the data of all the boxes in parallel
+	for _, box := range boxes.Boxes {
+		wg.Run(func(val interface{}) error {
+			boxName := val.([]byte)
+			boxValue, err := algoClient.GetApplicationBoxByName(appID, boxName).Do(ctx)
+			if err != nil {
+				return fmt.Errorf("unable to fetch box:%s, error:%w", string(boxName), err)
+			}
+			mapLock.Lock()
+			boxData[string(boxName)] = boxValue.Value
+			mapLock.Unlock()
+			return nil
+		}, box.Name)
+	}
+	errs := wg.Wait()
+	if errs != nil {
+		return nil, fmt.Errorf("error retrieving box data: %w", errs[0])
+	}
+	return boxData, nil
+}
+
 func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
+	// First try to resolve via V2
+	boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForNFD(nfdName)).Do(ctx)
+	if err == nil {
+		// The box data is stored as
+		// {ASA ID}{APP ID} - packed 64-bit ints
+		if len(boxValue.Value) != 16 {
+			return 0, fmt.Errorf("box data is invalid - length:%d but should be 16 for nfd name:%s", len(boxValue.Value), nfdName)
+		}
+		fmt.Println("Found as V2 name")
+		return binary.BigEndian.Uint64(boxValue.Value[8:]), nil
+	}
+	// fall back to V1 approach
 	nameLSIG, err := GetNFDSigNameLSIG(nfdName, registryAppID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get nfd sig name lsig: %w", err)
@@ -111,37 +181,67 @@ func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
 	// We found our registry contract in the local state of the account
 	nfdAppID, _ := FetchBToIFromState(account.AppLocalState.KeyValue, "i.appid")
 	if nfdAppID == 0 {
-		return 0, fmt.Errorf("failed to find appid in state of acccount:%s for rc id:%d", address.String(), registryAppID)
+		return 0, errors.New("no NFD found by that name")
 	}
+	fmt.Println("Found as V1 name")
 	return nfdAppID, nil
 }
 
-func FindNFDAppIDByAddress(ctx context.Context, lookupAddress string) (uint64, error) {
+func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64, error) {
+	var nfdAppIDs []uint64
 	// sanity check that this is valid address
 	algoAddress, err := types.DecodeAddress(lookupAddress)
 	if err != nil {
-		return 0, err
-	}
-	revAddressLSIG, err := GetNFDSigRevAddressLSIG(algoAddress, registryAppID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get nfd sig name lsig: %w", err)
-	}
-	// Read the local state for our registry SC from this specific account
-	address, _ := revAddressLSIG.Address()
-	account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get account data for account:%s : %w", address, err)
+		return nil, err
 	}
 
-	// We found our registry contract in the local state of the account
-	nfdAppIDs, err := FetchUint64sFromState(account.AppLocalState.KeyValue, "i.apps0")
-	if err != nil {
-		return 0, fmt.Errorf("failed to find appid in reverse address lookup: %w", err)
+	// First try to resolve via V2
+	boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForAddress(algoAddress)).Do(ctx)
+	if err == nil {
+		// Get the set of nfd app ids referenced by this address - we just grab the first for now
+		nfdAppIDs, err = FetchUInt64sFromPackedValue(boxValue.Value)
+		if err != nil {
+			return nil, fmt.Errorf("box address lookup data is invalid, error: %w", err)
+		}
+		fmt.Printf("Found %d NFDs linked as V2 address\n", len(nfdAppIDs))
+	} else {
+		// error should be 404 not found and checked, but but this is simple example, so... assume it's just not found
+		// fall back to V1 approach
+		revAddressLSIG, err := GetNFDSigRevAddressLSIG(algoAddress, registryAppID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get nfd sig name lsig: %w", err)
+		}
+		// Read the local state for our registry SC from this specific account
+		address, _ := revAddressLSIG.Address()
+		fmt.Printf("V1 Rev-Address used:%s\n", address.String())
+		account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get account data for account:%s : %w", address, err)
+		}
+
+		// We found our registry contract in the local state of the account
+		for idx := 0; idx < 16; idx++ {
+			thisKeyIDs, _ := FetchUint64sFromState(account.AppLocalState.KeyValue, fmt.Sprintf("i.apps%d", idx))
+			if thisKeyIDs == nil {
+				break
+			}
+			nfdAppIDs = append(nfdAppIDs, thisKeyIDs...)
+		}
+		fmt.Printf("Found %d NFDs linked as V1 address\n", len(nfdAppIDs))
 	}
 	if len(nfdAppIDs) == 0 {
-		return 0, fmt.Errorf("no NFDs found for this address")
+		return nil, fmt.Errorf("no NFDs found for this address")
 	}
-	return nfdAppIDs[0], nil
+	return nfdAppIDs, nil
+}
+
+func GetRegistryBoxNameForNFD(nfdName string) []byte {
+	hash := sha256.Sum256([]byte("name/" + nfdName))
+	return hash[:]
+}
+
+func GetRegistryBoxNameForAddress(algoAddress types.Address) []byte {
+	return algoAddress[:]
 }
 
 func getLookupLSIG(prefixBytes, lookupBytes string, registryAppID uint64) (crypto.LogicSigAccount, error) {
@@ -196,7 +296,7 @@ func getLookupLSIG(prefixBytes, lookupBytes string, registryAppID uint64) (crypt
 	nBytes := binary.PutUvarint(uvarIntBytes, uint64(len(bytesToAppend)))
 	composedBytecode := bytes.Join([][]byte{sigLookupByteCode, uvarIntBytes[:nBytes], bytesToAppend}, nil)
 
-	logicSig := crypto.MakeLogicSigAccountEscrow(composedBytecode, [][]byte{})
+	logicSig, _ := crypto.MakeLogicSigAccountEscrowChecked(composedBytecode, [][]byte{})
 	return logicSig, nil
 }
 
@@ -293,7 +393,7 @@ func (a byKeyName) Less(i, j int) bool {
 	return bytes.Compare(keyI, keyJ) == -1
 }
 
-func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties {
+func FetchAllStateAsNFDProperties(appState []models.TealKeyValue, boxData map[string][]byte) NFDProperties {
 	isStringPrintable := func(str string) bool {
 		for _, strRune := range str {
 			if !strconv.IsPrint(strRune) {
@@ -308,21 +408,18 @@ func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties 
 			UserDefined: map[string]string{},
 			Verified:    map[string]string{},
 		}
-		decodedKey    string
+		key           string
 		valAsStr      string
 		algoAddresses []string
 	)
 	// Some keys must be sorted to ensure proper ordering of decoding (v.caAlgo.0.as, v.caAlgo.1.as, .. for eg)
 	sort.Sort(byKeyName(appState))
-	for _, kv := range appState {
-		rawKey, _ := base64.StdEncoding.DecodeString(kv.Key)
-		decodedKey = string(rawKey)
 
-		switch kv.Value.Type {
+	processKeyAndVal := func(key string, valType uint64, intVal uint64, stringVal []byte) {
+		switch valType {
 		case 1: // bytes
-			value, _ := base64.StdEncoding.DecodeString(kv.Value.Bytes)
-			if strings.HasSuffix(decodedKey, ".as") { // caAlgo.#.as (sets of packed algorand addresses)
-				addresses, err := FetchAlgoAddressesFromPackedValue(value)
+			if strings.HasSuffix(key, ".as") { // caAlgo.##.as (sets of packed algorand addresses)
+				addresses, err := FetchAlgoAddressesFromPackedValue(stringVal)
 				if err != nil {
 					valAsStr = err.Error()
 					break
@@ -330,31 +427,44 @@ func FetchAllStateAsNFDProperties(appState []models.TealKeyValue) NFDProperties 
 				algoAddresses = append(algoAddresses, addresses...)
 				// Don't set into the state map - just collect the addresses and we set them into a single caAlgo field
 				// at the end, as a comma-delimited string.
-				continue
-			} else if len(value) == 32 && strings.HasSuffix(decodedKey, ".a") {
+				return
+			} else if len(stringVal) == 32 && strings.HasSuffix(key, ".a") {
 				// 32 bytes and key name has .a [algorand address] suffix - parse accordingly - strip suffix
-				encodedAddr, _ := types.EncodeAddress(value)
-				valAsStr = encodedAddr
-				decodedKey = strings.TrimSuffix(decodedKey, ".a")
-			} else if len(value) == 8 && !isStringPrintable(string(value)) {
+				valAsStr = RawPKAsAddress(stringVal).String()
+				key = strings.TrimSuffix(key, ".a")
+			} else if len(stringVal) == 8 && !isStringPrintable(string(stringVal)) {
 				// Assume it's a big-endian integer
-				valAsStr = strconv.FormatUint(binary.BigEndian.Uint64(value), 10)
+				valAsStr = strconv.FormatUint(binary.BigEndian.Uint64(stringVal), 10)
 			} else {
-				valAsStr = string(value)
+				valAsStr = string(stringVal)
 			}
 		case 2: // uint
-			valAsStr = strconv.FormatUint(kv.Value.Uint, 10)
+			valAsStr = strconv.FormatUint(intVal, 10)
 		default:
 			valAsStr = "unknown"
 		}
-		switch decodedKey[0:2] {
+		switch key[0:2] {
 		case "i.":
-			state.Internal[decodedKey[2:]] = valAsStr
+			state.Internal[key[2:]] = valAsStr
 		case "u.":
-			state.UserDefined[decodedKey[2:]] = valAsStr
+			state.UserDefined[key[2:]] = valAsStr
 		case "v.":
-			state.Verified[decodedKey[2:]] = valAsStr
+			state.Verified[key[2:]] = valAsStr
 		}
+	}
+
+	for _, kv := range appState {
+		rawKey, _ := base64.StdEncoding.DecodeString(kv.Key)
+		key = string(rawKey)
+		if kv.Value.Type == 1 {
+			value, _ := base64.StdEncoding.DecodeString(kv.Value.Bytes)
+			processKeyAndVal(key, kv.Value.Type, kv.Value.Uint, value)
+		} else {
+			processKeyAndVal(key, kv.Value.Type, kv.Value.Uint, nil)
+		}
+	}
+	for key, val := range boxData {
+		processKeyAndVal(key, 1, 0, val)
 	}
 	if len(algoAddresses) > 0 {
 		state.Verified["caAlgo"] = strings.Join(algoAddresses, ",")
