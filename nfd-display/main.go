@@ -47,7 +47,7 @@ func main() {
 		err     error
 		name    = flag.String("name", "", ".algo Name for forward lookup")
 		address = flag.String("addr", "", "Algorand address for reverse-address lookup")
-		network = flag.String("network", "mainnet", "network: mainnet, testnet, or specify algod, token, regApp parameters")
+		network = flag.String("network", "mainnet", "network: mainnet, testnet, betanet, or specify algod, token, regApp parameters")
 		algoUrl = flag.String("algod", "", "url of algod host to connect to (ie: http://localhost:8080)")
 		token   = flag.String("token", "", "api key token to pass to algod (if needed)")
 		regApp  = flag.Uint64("regApp", 0, "registry smart contract ID (for local dev)")
@@ -64,6 +64,9 @@ func main() {
 	} else {
 		// Set registry id and set up algod connection to public algod endpoint
 		switch *network {
+		case "betanet":
+			registryAppID = 842656530
+			algoClient, err = algod.MakeClient("https://betanet-api.algonode.cloud", "")
 		case "testnet":
 			registryAppID = 84366825
 			algoClient, err = algod.MakeClient("https://testnet-api.algonode.cloud", "")
