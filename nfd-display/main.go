@@ -244,7 +244,8 @@ func GetRegistryBoxNameForNFD(nfdName string) []byte {
 }
 
 func GetRegistryBoxNameForAddress(algoAddress types.Address) []byte {
-	return algoAddress[:]
+	hash := sha256.Sum256(bytes.Join([][]byte{[]byte("addr/algo/"), algoAddress[:]}, nil))
+	return hash[:]
 }
 
 func getLookupLSIG(prefixBytes, lookupBytes string, registryAppID uint64) (crypto.LogicSigAccount, error) {
