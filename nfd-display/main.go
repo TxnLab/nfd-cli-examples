@@ -180,6 +180,7 @@ func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get account data for account:%s : %w", address, err)
 	}
+	fmt.Printf("V1 LSIG Address used:%s\n", address.String())
 
 	// We found our registry contract in the local state of the account
 	nfdAppID, _ := FetchBToIFromState(account.AppLocalState.KeyValue, "i.appid")
@@ -216,7 +217,7 @@ func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64
 		}
 		// Read the local state for our registry SC from this specific account
 		address, _ := revAddressLSIG.Address()
-		fmt.Printf("V1 Rev-Address used:%s\n", address.String())
+		fmt.Printf("V1 LSIG Rev-Address used:%s\n", address.String())
 		account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get account data for account:%s : %w", address, err)
