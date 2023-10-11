@@ -166,8 +166,10 @@ func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
 		if len(boxValue.Value) != 16 {
 			return 0, fmt.Errorf("box data is invalid - length:%d but should be 16 for nfd name:%s", len(boxValue.Value), nfdName)
 		}
-		fmt.Println("Found as V2 name")
-		return binary.BigEndian.Uint64(boxValue.Value[8:]), nil
+		asaID := binary.BigEndian.Uint64(boxValue.Value[0:8])
+		appID := binary.BigEndian.Uint64(boxValue.Value[8:])
+		fmt.Printf("Found as V2 name, ASA ID:%d, APP ID:%d\n", asaID, appID)
+		return appID, nil
 	}
 	// fall back to V1 approach
 	nameLSIG, err := GetNFDSigNameLSIG(nfdName, registryAppID)
