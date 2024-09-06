@@ -47,6 +47,7 @@ func main() {
 		err     error
 		name    = flag.String("name", "", ".algo Name for forward lookup")
 		address = flag.String("addr", "", "Algorand address for reverse-address lookup")
+		owns    = flag.Bool("owns", false, "Show owned NFDs for an address instead of reverse lookup - V3+ nfds only")
 		network = flag.String("network", "mainnet", "network: mainnet, testnet, betanet, or specify algod, token, regApp parameters")
 		algoUrl = flag.String("algod", "", "url of algod host to connect to (ie: http://localhost:8080)")
 		token   = flag.String("token", "", "api key token to pass to algod (if needed)")
@@ -64,6 +65,12 @@ func main() {
 	} else {
 		// Set registry id and set up algod connection to public algod endpoint
 		switch *network {
+		case "localnet":
+			if *regApp == 0 {
+				log.Fatalln("You must specify a registry app id for localnet")
+			}
+			registryAppID = *regApp
+			algoClient, err = algod.MakeClient("http://localhost:4001", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		case "betanet":
 			registryAppID = 842656530
 			algoClient, err = algod.MakeClient("https://betanet-api.algonode.cloud", "")
@@ -89,7 +96,16 @@ func main() {
 		}
 		displayNFD(ctx, appID)
 	} else if *address != "" {
-		appIDs, err := FindNFDAppIDsByAddress(ctx, *address)
+		var (
+			appIDs []uint64
+			err    error
+		)
+		if *owns {
+			appIDs, err = FindNfdsOwnedByAddress(ctx, *address)
+
+		} else {
+			appIDs, err = FindNFDAppIDsByAddress(ctx, *address)
+		}
 		if err != nil {
 			log.Fatalln("Error in finding/fetching address:", *address, "error:", err)
 		}
@@ -193,6 +209,30 @@ func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
 	return nfdAppID, nil
 }
 
+func FindNfdsOwnedByAddress(ctx context.Context, lookupAddress string) ([]uint64, error) {
+	var nfdAppIDs []uint64
+
+	// For now we have to get ALL boxes from the registry (which for now is
+	// completely unusable - but a new endpoint will hopefully come allowing prefix
+	// searches.
+	boxes, err := algoClient.GetApplicationBoxes(registryAppID).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get boxes for registry: %w", err)
+	}
+	lookupAddr, err := types.DecodeAddress(lookupAddress)
+	if err != nil {
+		return nil, err
+	}
+	prefixToFind := GetAccountOwnsNfdBoxName(lookupAddr, 0)[:33] // grab first 33 bytes only
+	for _, box := range boxes.Boxes {
+		if bytes.HasPrefix(box.Name, prefixToFind) {
+			nfdAppIDs = append(nfdAppIDs, binary.BigEndian.Uint64(box.Name[33:]))
+		}
+	}
+	fmt.Printf("Found %d NFDs owned by the address\n", len(nfdAppIDs))
+	return nfdAppIDs, nil
+}
+
 func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64, error) {
 	var nfdAppIDs []uint64
 	// sanity check that this is valid address
@@ -211,7 +251,7 @@ func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64
 		}
 		fmt.Printf("Found %d NFDs linked as V2 address\n", len(nfdAppIDs))
 	} else {
-		// error should be 404 not found and checked, but but this is simple example, so... assume it's just not found
+		// error should be 404 not found and checked, but this is simple example, so... assume it's just not found
 		// fall back to V1 approach
 		revAddressLSIG, err := GetNFDSigRevAddressLSIG(algoAddress, registryAppID)
 		if err != nil {
@@ -222,7 +262,7 @@ func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64
 		fmt.Printf("V1 LSIG Rev-Address used:%s\n", address.String())
 		account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get account data for account:%s : %w", address, err)
+			return nil, nil
 		}
 
 		// We found our registry contract in the local state of the account
@@ -249,6 +289,12 @@ func GetRegistryBoxNameForNFD(nfdName string) []byte {
 func GetRegistryBoxNameForAddress(algoAddress types.Address) []byte {
 	hash := sha256.Sum256(bytes.Join([][]byte{[]byte("addr/algo/"), algoAddress[:]}, nil))
 	return hash[:]
+}
+
+func GetAccountOwnsNfdBoxName(algoAddress types.Address, nfdAppId uint64) []byte {
+	var appId [8]byte
+	binary.BigEndian.PutUint64(appId[:], nfdAppId)
+	return bytes.Join([][]byte{[]byte("O"), algoAddress[:], appId[:]}, nil)
 }
 
 func getLookupLSIG(prefixBytes, lookupBytes string, registryAppID uint64) (crypto.LogicSigAccount, error) {
