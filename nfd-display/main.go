@@ -41,6 +41,8 @@ type NFDProperties struct {
 	Verified    map[string]string `json:"verified"`
 }
 
+var v1Only = flag.Bool("v1Only", false, "Only do v1 check")
+
 func main() {
 	var (
 		ctx     = context.Background()
@@ -174,18 +176,20 @@ func GetApplicationBoxes(ctx context.Context, appID uint64) (map[string][]byte, 
 }
 
 func FindNFDAppIDByName(ctx context.Context, nfdName string) (uint64, error) {
-	// First try to resolve via V2
-	boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForNFD(nfdName)).Do(ctx)
-	if err == nil {
-		// The box data is stored as
-		// {ASA ID}{APP ID} - packed 64-bit ints
-		if len(boxValue.Value) != 16 {
-			return 0, fmt.Errorf("box data is invalid - length:%d but should be 16 for nfd name:%s", len(boxValue.Value), nfdName)
+	if !*v1Only {
+		// First try to resolve via V2
+		boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForNFD(nfdName)).Do(ctx)
+		if err == nil {
+			// The box data is stored as
+			// {ASA ID}{APP ID} - packed 64-bit ints
+			if len(boxValue.Value) != 16 {
+				return 0, fmt.Errorf("box data is invalid - length:%d but should be 16 for nfd name:%s", len(boxValue.Value), nfdName)
+			}
+			asaID := binary.BigEndian.Uint64(boxValue.Value[0:8])
+			appID := binary.BigEndian.Uint64(boxValue.Value[8:])
+			fmt.Printf("Found as V2 name, ASA ID:%d, APP ID:%d\n", asaID, appID)
+			return appID, nil
 		}
-		asaID := binary.BigEndian.Uint64(boxValue.Value[0:8])
-		appID := binary.BigEndian.Uint64(boxValue.Value[8:])
-		fmt.Printf("Found as V2 name, ASA ID:%d, APP ID:%d\n", asaID, appID)
-		return appID, nil
 	}
 	// fall back to V1 approach
 	nameLSIG, err := GetNFDSigNameLSIG(nfdName, registryAppID)
@@ -223,6 +227,15 @@ func FindNfdsOwnedByAddress(ctx context.Context, lookupAddress string) ([]uint64
 	if err != nil {
 		return nil, err
 	}
+	// prefixToFind := GetAccountOwnsNfdBoxName(lookupAddr)
+	// prefixToFindBase64 := base64.URLEncoding.EncodeToString(prefixToFind)
+	// boxes, err := algoClient.GetApplicationBoxes(registryAppID).
+	// 	Prefix(fmt.Sprintf("b64:%s", prefixToFindBase64)).
+	// 	Values(true).
+	// 	Do(ctx)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to get boxes for registry: %w", err)
+	// }
 	prefixToFind := GetAccountOwnsNfdBoxName(lookupAddr, 0)[:33] // grab first 33 bytes only
 	for _, box := range boxes.Boxes {
 		if bytes.HasPrefix(box.Name, prefixToFind) {
@@ -241,40 +254,45 @@ func FindNFDAppIDsByAddress(ctx context.Context, lookupAddress string) ([]uint64
 		return nil, err
 	}
 
-	// First try to resolve via V2
-	boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForAddress(algoAddress)).Do(ctx)
-	if err == nil {
-		// Get the set of nfd app ids referenced by this address - we just grab the first for now
-		nfdAppIDs, err = FetchUInt64sFromPackedValue(boxValue.Value)
-		if err != nil {
-			return nil, fmt.Errorf("box address lookup data is invalid, error: %w", err)
-		}
-		fmt.Printf("Found %d NFDs linked as V2 address\n", len(nfdAppIDs))
-	} else {
-		// error should be 404 not found and checked, but this is simple example, so... assume it's just not found
-		// fall back to V1 approach
-		revAddressLSIG, err := GetNFDSigRevAddressLSIG(algoAddress, registryAppID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get nfd sig name lsig: %w", err)
-		}
-		// Read the local state for our registry SC from this specific account
-		address, _ := revAddressLSIG.Address()
-		fmt.Printf("V1 LSIG Rev-Address used:%s\n", address.String())
-		account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
-		if err != nil {
-			return nil, nil
-		}
-
-		// We found our registry contract in the local state of the account
-		for idx := 0; idx < 16; idx++ {
-			thisKeyIDs, _ := FetchUint64sFromState(account.AppLocalState.KeyValue, fmt.Sprintf("i.apps%d", idx))
-			if thisKeyIDs == nil {
-				break
+	if !*v1Only {
+		// First try to resolve via V2
+		boxValue, err := algoClient.GetApplicationBoxByName(registryAppID, GetRegistryBoxNameForAddress(algoAddress)).Do(ctx)
+		if err == nil {
+			// Get the set of nfd app ids referenced by this address - we just grab the first for now
+			nfdAppIDs, err = FetchUInt64sFromPackedValue(boxValue.Value)
+			if err != nil {
+				return nil, fmt.Errorf("box address lookup data is invalid, error: %w", err)
 			}
-			nfdAppIDs = append(nfdAppIDs, thisKeyIDs...)
+			fmt.Printf("Found %d NFDs linked as V2 address\n", len(nfdAppIDs))
 		}
-		fmt.Printf("Found %d NFDs linked as V1 address\n", len(nfdAppIDs))
+		if len(nfdAppIDs) == 0 {
+			return nil, fmt.Errorf("no NFDs found for this address")
+		}
+		return nfdAppIDs, nil
 	}
+	// error should be 404 not found and checked, but this is simple example, so... assume it's just not found
+	// fall back to V1 approach
+	revAddressLSIG, err := GetNFDSigRevAddressLSIG(algoAddress, registryAppID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get nfd sig name lsig: %w", err)
+	}
+	// Read the local state for our registry SC from this specific account
+	address, _ := revAddressLSIG.Address()
+	fmt.Printf("V1 LSIG Rev-Address used:%s\n", address.String())
+	account, err := algoClient.AccountApplicationInformation(address.String(), registryAppID).Do(ctx)
+	if err != nil {
+		return nil, nil
+	}
+
+	// We found our registry contract in the local state of the account
+	for idx := 0; idx < 16; idx++ {
+		thisKeyIDs, _ := FetchUint64sFromState(account.AppLocalState.KeyValue, fmt.Sprintf("i.apps%d", idx))
+		if thisKeyIDs == nil {
+			break
+		}
+		nfdAppIDs = append(nfdAppIDs, thisKeyIDs...)
+	}
+	fmt.Printf("Found %d NFDs linked as V1 address\n", len(nfdAppIDs))
 	if len(nfdAppIDs) == 0 {
 		return nil, fmt.Errorf("no NFDs found for this address")
 	}
